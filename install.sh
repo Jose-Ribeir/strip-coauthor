@@ -24,6 +24,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK_SRC="$SCRIPT_DIR/pre-push"
 MARKER="strip-coauthor dispatcher"
+# Line 2 of the hook itself, current and 1.0.0 versions.
+HOOK_HEADER="# strip-coauthor: git pre-push hook that removes Co-Authored-By trailers from"
+OLD_HEADER="# Strip Co-Authored-By trailers from all commits that are about to be pushed."
 
 GLOBAL=0
 if [[ "${1:-}" == "--global" ]]; then
@@ -51,9 +54,10 @@ mkdir -p "$TARGET_DIR"
 DISPATCHER="$TARGET_DIR/pre-push"
 CHAINED="$TARGET_DIR/pre-push.chained"
 
-if [[ -e "$DISPATCHER" ]] && ! grep -q "$MARKER" "$DISPATCHER"; then
-  if grep -q "strip-coauthor" "$DISPATCHER"; then
-    # A pre-dispatcher copy of strip-coauthor itself: replace it.
+if [[ -e "$DISPATCHER" ]] && ! grep -qF "$MARKER" "$DISPATCHER"; then
+  if sed -n 2p "$DISPATCHER" | grep -qxF -e "$OLD_HEADER" -e "$HOOK_HEADER"; then
+    # A copy of the strip-coauthor hook itself installed without the
+    # dispatcher (older installer, or copied by hand): replace it.
     rm -f "$DISPATCHER"
   elif [[ -e "$CHAINED" ]]; then
     echo "Both $DISPATCHER and $CHAINED exist and neither is managed by" >&2
