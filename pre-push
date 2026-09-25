@@ -1,133 +1,176 @@
 #!/usr/bin/env bash
-# Strip Co-Authored-By trailers from all commits that are about to be pushed.
+# strip-coauthor: git pre-push hook that removes Co-Authored-By trailers from
+# every commit about to be pushed.
 #
-# Install (one repo):
-#   cp ~/.claude/tools/strip-coauthor/pre-push .git/hooks/pre-push
-#   chmod +x .git/hooks/pre-push
-#
-# Install (globally, alongside existing global hook):
-#   bash ~/.claude/tools/strip-coauthor/install.sh
+# Install:
+#   bash install.sh             # this repo
+#   bash install.sh --global    # every repo (via core.hooksPath)
 #
 # How it works:
-#   Reads the ref lines git feeds on stdin, identifies every commit that is
-#   new on this push (i.e. not yet on the remote), and rewrites each one
-#   with `git commit --amend` via `git filter-branch`-free rebase if the
-#   Co-Authored-By trailer is present.  Uses `git filter-repo` when
-#   available; falls back to a pure-bash interactive-rebase simulation via
-#   GIT_SEQUENCE_EDITOR.
+#   Git passes <remote-name> <remote-url> as arguments and one line per ref on
+#   stdin: "<local-ref> <local-sha> <remote-ref> <remote-sha>".  For every
+#   branch being pushed, the hook lists the commits the remote does not have
+#   yet.  If any of them carries a Co-Authored-By line, those commits (and
+#   their descendants) are re-created with the line removed, using git
+#   plumbing only (cat-file / hash-object / update-ref): no checkout, no
+#   rebase, trees untouched.  Each affected local branch is then moved to the
+#   rewritten history, whether or not it is checked out.
+#
+#   Git has already chosen which commits to send before this hook runs, so a
+#   push that needed rewriting is stopped (exit 1) and you are asked to run
+#   the same push again.  The second push sends the clean commits.
+#
+# The logic is Python (3.7+); this bash wrapper only locates an interpreter,
+# because `python3` is missing or a Store stub on many Windows machines.
 
 set -euo pipefail
 
-REFS="$(cat || true)"
-
-# Nothing to do if there are no refs (e.g. tag-only push).
-if [[ -z "$REFS" ]]; then
-  exit 0
-fi
-
-# Collect the range of commits being pushed for each ref line.
-NEW_COMMITS=()
-while IFS=' ' read -r _local_ref local_sha _remote_ref remote_sha; do
-  # All-zeros remote sha means the branch doesn't exist yet on the remote.
-  if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
-    range="$(git rev-list --reverse "$local_sha")"
-  else
-    range="$(git rev-list --reverse "${remote_sha}..${local_sha}")"
-  fi
-  while IFS= read -r sha; do
-    [[ -n "$sha" ]] && NEW_COMMITS+=("$sha")
-  done <<< "$range"
-done <<< "$REFS"
-
-if [[ ${#NEW_COMMITS[@]} -eq 0 ]]; then
-  exit 0
-fi
-
-# Check whether any of those commits carry a Co-Authored-By trailer.
-NEEDS_STRIP=()
-for sha in "${NEW_COMMITS[@]}"; do
-  if git log -1 --format="%B" "$sha" | grep -qi "^Co-Authored-By:"; then
-    NEEDS_STRIP+=("$sha")
+PYTHON=""
+for candidate in python3 python py; do
+  if command -v "$candidate" >/dev/null 2>&1 &&
+     "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 7))' >/dev/null 2>&1; then
+    PYTHON="$candidate"
+    break
   fi
 done
 
-if [[ ${#NEEDS_STRIP[@]} -eq 0 ]]; then
-  exit 0
+if [[ -z "$PYTHON" ]]; then
+  echo "[strip-coauthor] Python 3.7+ not found (tried python3, python, py); push blocked." >&2
+  exit 1
 fi
 
-echo "[strip-coauthor] Removing Co-Authored-By from ${#NEEDS_STRIP[@]} commit(s)…" >&2
+read -r -d '' STRIP_COAUTHOR_PY <<'PY' || true
+import re
+import subprocess
+import sys
 
-# Build the set of SHAs to rewrite for fast lookup.
-declare -A STRIP_SET
-for sha in "${NEEDS_STRIP[@]}"; do
-  STRIP_SET["$sha"]=1
-done
+TRAILER = re.compile(rb"^co-authored-by:", re.IGNORECASE)
+SIGNATURE_HEADERS = (b"gpgsig ", b"gpgsig-sha256 ")
+REFLOG_MSG = "strip-coauthor: remove Co-Authored-By trailers"
 
-# Find the oldest commit to rewrite.
-OLDEST="${NEEDS_STRIP[0]}"
-PARENT="$(git rev-parse "${OLDEST}^" 2>/dev/null || true)"
 
-# Use GIT_SEQUENCE_EDITOR to drive a non-interactive rebase.
-SCRIPT="$(mktemp)"
-trap 'rm -f "$SCRIPT"' EXIT
+def log(msg):
+    print(f"[strip-coauthor] {msg}", file=sys.stderr)
 
-cat > "$SCRIPT" <<'PY'
-#!/usr/bin/env python3
-import os, sys, re
 
-todo_path = sys.argv[1]
-strip_set = set(os.environ.get("_STRIP_COAUTHOR_SHAS", "").split())
+def git(*args, stdin=None):
+    return subprocess.run(
+        ["git", *args], input=stdin, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, check=True,
+    ).stdout
 
-with open(todo_path) as f:
-    lines = f.readlines()
 
-out = []
-for line in lines:
-    parts = line.strip().split()
-    if len(parts) >= 2 and parts[1] in strip_set:
-        out.append(f"reword {parts[1]} {' '.join(parts[2:])}\n")
-    else:
+def is_zero(sha):
+    return set(sha) == {"0"}
+
+
+def commit_exists(sha):
+    return subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def strip_message(message):
+    lines = message.split(b"\n")
+    kept = [line for line in lines if not TRAILER.match(line)]
+    if len(kept) == len(lines):
+        return message
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return b"\n".join(kept) + b"\n" if kept else b""
+
+
+def rewrite(raw, new_parents):
+    """Return (new raw commit, message_changed) for a raw commit object."""
+    header, sep, message = raw.partition(b"\n\n")
+    new_message = strip_message(message)
+    out, in_signature = [], False
+    for line in header.split(b"\n"):
+        if in_signature and line.startswith(b" "):
+            continue
+        in_signature = False
+        if line.startswith(SIGNATURE_HEADERS):
+            # The signature covers the old content; it cannot survive a rewrite.
+            in_signature = True
+            continue
+        if line.startswith(b"parent "):
+            old = line[len(b"parent "):].decode()
+            line = b"parent " + new_parents.get(old, old).encode()
         out.append(line)
+    return b"\n".join(out) + sep + new_message, new_message != message
 
-with open(todo_path, "w") as f:
-    f.writelines(out)
+
+def outgoing_commits(remote, local_sha, remote_sha):
+    """Commits reachable from local_sha that the remote does not have, oldest first."""
+    if not is_zero(remote_sha) and commit_exists(remote_sha):
+        exclude = [remote_sha]
+    else:
+        # New branch (or remote tip unknown locally): anything already on a
+        # remote-tracking branch of this remote is published, leave it alone.
+        exclude = [f"--remotes={remote}"] if remote else []
+    args = ["rev-list", "--reverse", "--topo-order", local_sha]
+    if exclude:
+        args += ["--not", *exclude]
+    return git(*args).decode().split()
+
+
+def main():
+    remote = sys.argv[1] if len(sys.argv) > 1 else ""
+    mapping = {}   # old sha -> rewritten sha
+    visited = set()
+    stripped = 0
+    updates = []   # (local_ref, old_sha, new_sha)
+
+    for line in sys.stdin:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, remote_ref, remote_sha = parts
+        if is_zero(local_sha):
+            continue  # deleting a remote ref: nothing is sent
+        if not remote_ref.startswith("refs/heads/"):
+            continue  # tags and other refs are pushed as-is
+
+        for sha in outgoing_commits(remote, local_sha, remote_sha):
+            if sha in visited:
+                continue
+            visited.add(sha)
+            raw = git("cat-file", "commit", sha)
+            new_raw, changed = rewrite(raw, mapping)
+            if new_raw == raw:
+                continue
+            stripped += changed
+            mapping[sha] = git("hash-object", "-t", "commit", "-w", "--stdin",
+                               stdin=new_raw).decode().strip()
+
+        if local_sha in mapping:
+            updates.append((local_ref, local_sha, mapping[local_sha]))
+
+    if not updates:
+        return 0
+
+    for local_ref, old, new in updates:
+        if local_ref != "HEAD" and not local_ref.startswith("refs/"):
+            log(f"Cannot move '{local_ref}' to the rewritten history; "
+                f"push {new} instead.")
+            return 1
+        git("update-ref", "-m", REFLOG_MSG, local_ref, new, old)
+        log(f"{local_ref}: {old[:10]} -> {new[:10]}")
+
+    log(f"Removed Co-Authored-By from {stripped} commit(s).")
+    log("Push stopped because git had already picked the original commits.")
+    log("Run the same git push again to send the rewritten ones.")
+    return 1
+
+
+try:
+    sys.exit(main())
+except subprocess.CalledProcessError as err:
+    log(f"git {' '.join(err.cmd[1:])} failed: "
+        f"{err.stderr.decode(errors='replace').strip()}")
+    log("Push blocked.")
+    sys.exit(1)
 PY
-chmod +x "$SCRIPT"
 
-# GIT_EDITOR is called for each "reword" commit; strip the trailer there.
-EDITOR_SCRIPT="$(mktemp)"
-trap 'rm -f "$SCRIPT" "$EDITOR_SCRIPT"' EXIT
-
-cat > "$EDITOR_SCRIPT" <<'SH'
-#!/usr/bin/env bash
-# Remove Co-Authored-By lines from the commit message file passed by git.
-msg_file="$1"
-tmp="$(mktemp)"
-grep -iv "^Co-Authored-By:" "$msg_file" > "$tmp" || true
-# Trim trailing blank lines left by the removal.
-awk '/^[[:space:]]*$/{blank++; next} {for(i=0;i<blank;i++) print ""; blank=0; print}' "$tmp" > "$msg_file"
-rm -f "$tmp"
-SH
-chmod +x "$EDITOR_SCRIPT"
-
-export _STRIP_COAUTHOR_SHAS="${NEEDS_STRIP[*]}"
-export GIT_SEQUENCE_EDITOR="$SCRIPT"
-export GIT_EDITOR="$EDITOR_SCRIPT"
-
-if [[ -n "$PARENT" ]]; then
-  git rebase -i "$PARENT" --no-autosquash --quiet 2>&1 | grep -v "^$" >&2 || {
-    echo "[strip-coauthor] Rebase failed — aborting and restoring original HEAD." >&2
-    git rebase --abort 2>/dev/null || true
-    exit 1
-  }
-else
-  # Oldest commit has no parent — it's the root commit.
-  git rebase -i --root --no-autosquash --quiet 2>&1 | grep -v "^$" >&2 || {
-    echo "[strip-coauthor] Rebase failed — aborting and restoring original HEAD." >&2
-    git rebase --abort 2>/dev/null || true
-    exit 1
-  }
-fi
-
-echo "[strip-coauthor] Done." >&2
-exit 0
+exec "$PYTHON" -c "$STRIP_COAUTHOR_PY" "$@"
