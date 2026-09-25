@@ -1,0 +1,39 @@
+{
+  "name": "strip-coauthor",
+  "version": "1.0.0",
+  "description": "Git pre-push hook that silently removes Co-Authored-By trailers before pushing",
+  "keywords": [
+    "git",
+    "hook",
+    "pre-push",
+    "co-authored-by",
+    "claude",
+    "ai",
+    "privacy",
+    "commit"
+  ],
+  "homepage": "https://github.com/Jose-Ribeir/strip-coauthor#readme",
+  "bugs": {
+    "url": "https://github.com/Jose-Ribeir/strip-coauthor/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jose-Ribeir/strip-coauthor.git"
+  },
+  "license": "MIT",
+  "author": "Jose-Ribeir",
+  "bin": {
+    "strip-coauthor": "./bin/strip-coauthor.js"
+  },
+  "files": [
+    "bin/",
+    "pre-push",
+    "install.sh"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "scripts": {
+    "test": "bash test/test.sh"
+  }
+}

@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Strip Co-Authored-By trailers from all commits that are about to be pushed.
+#
+# Install (one repo):
+#   cp ~/.claude/tools/strip-coauthor/pre-push .git/hooks/pre-push
+#   chmod +x .git/hooks/pre-push
+#
+# Install (globally, alongside existing global hook):
+#   bash ~/.claude/tools/strip-coauthor/install.sh
+#
+# How it works:
+#   Reads the ref lines git feeds on stdin, identifies every commit that is
+#   new on this push (i.e. not yet on the remote), and rewrites each one
+#   with `git commit --amend` via `git filter-branch`-free rebase if the
+#   Co-Authored-By trailer is present.  Uses `git filter-repo` when
+#   available; falls back to a pure-bash interactive-rebase simulation via
+#   GIT_SEQUENCE_EDITOR.
+
+set -euo pipefail
+
+REFS="$(cat || true)"
+
+# Nothing to do if there are no refs (e.g. tag-only push).
+if [[ -z "$REFS" ]]; then
+  exit 0
+fi
+
+# Collect the range of commits being pushed for each ref line.
+NEW_COMMITS=()
+while IFS=' ' read -r _local_ref local_sha _remote_ref remote_sha; do
+  # All-zeros remote sha means the branch doesn't exist yet on the remote.
+  if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
+    range="$(git rev-list --reverse "$local_sha")"
+  else
+    range="$(git rev-list --reverse "${remote_sha}..${local_sha}")"
+  fi
+  while IFS= read -r sha; do
+    [[ -n "$sha" ]] && NEW_COMMITS+=("$sha")
+  done <<< "$range"
+done <<< "$REFS"
+
+if [[ ${#NEW_COMMITS[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+# Check whether any of those commits carry a Co-Authored-By trailer.
+NEEDS_STRIP=()
+for sha in "${NEW_COMMITS[@]}"; do
+  if git log -1 --format="%B" "$sha" | grep -qi "^Co-Authored-By:"; then
+    NEEDS_STRIP+=("$sha")
+  fi
+done
+
+if [[ ${#NEEDS_STRIP[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+echo "[strip-coauthor] Removing Co-Authored-By from ${#NEEDS_STRIP[@]} commit(s)…" >&2
+
+# Build the set of SHAs to rewrite for fast lookup.
+declare -A STRIP_SET
+for sha in "${NEEDS_STRIP[@]}"; do
+  STRIP_SET["$sha"]=1
+done
+
+# Find the oldest commit to rewrite.
+OLDEST="${NEEDS_STRIP[0]}"
+PARENT="$(git rev-parse "${OLDEST}^" 2>/dev/null || true)"
+
+# Use GIT_SEQUENCE_EDITOR to drive a non-interactive rebase.
+SCRIPT="$(mktemp)"
+trap 'rm -f "$SCRIPT"' EXIT
+
+cat > "$SCRIPT" <<'PY'
+#!/usr/bin/env python3
+import os, sys, re
+
+todo_path = sys.argv[1]
+strip_set = set(os.environ.get("_STRIP_COAUTHOR_SHAS", "").split())
+
+with open(todo_path) as f:
+    lines = f.readlines()
+
+out = []
+for line in lines:
+    parts = line.strip().split()
+    if len(parts) >= 2 and parts[1] in strip_set:
+        out.append(f"reword {parts[1]} {' '.join(parts[2:])}\n")
+    else:
+        out.append(line)
+
+with open(todo_path, "w") as f:
+    f.writelines(out)
+PY
+chmod +x "$SCRIPT"
+
+# GIT_EDITOR is called for each "reword" commit; strip the trailer there.
+EDITOR_SCRIPT="$(mktemp)"
+trap 'rm -f "$SCRIPT" "$EDITOR_SCRIPT"' EXIT
+
+cat > "$EDITOR_SCRIPT" <<'SH'
+#!/usr/bin/env bash
+# Remove Co-Authored-By lines from the commit message file passed by git.
+msg_file="$1"
+tmp="$(mktemp)"
+grep -iv "^Co-Authored-By:" "$msg_file" > "$tmp" || true
+# Trim trailing blank lines left by the removal.
+awk '/^[[:space:]]*$/{blank++; next} {for(i=0;i<blank;i++) print ""; blank=0; print}' "$tmp" > "$msg_file"
+rm -f "$tmp"
+SH
+chmod +x "$EDITOR_SCRIPT"
+
+export _STRIP_COAUTHOR_SHAS="${NEEDS_STRIP[*]}"
+export GIT_SEQUENCE_EDITOR="$SCRIPT"
+export GIT_EDITOR="$EDITOR_SCRIPT"
+
+if [[ -n "$PARENT" ]]; then
+  git rebase -i "$PARENT" --no-autosquash --quiet 2>&1 | grep -v "^$" >&2 || {
+    echo "[strip-coauthor] Rebase failed — aborting and restoring original HEAD." >&2
+    git rebase --abort 2>/dev/null || true
+    exit 1
+  }
+else
+  # Oldest commit has no parent — it's the root commit.
+  git rebase -i --root --no-autosquash --quiet 2>&1 | grep -v "^$" >&2 || {
+    echo "[strip-coauthor] Rebase failed — aborting and restoring original HEAD." >&2
+    git rebase --abort 2>/dev/null || true
+    exit 1
+  }
+fi
+
+echo "[strip-coauthor] Done." >&2
+exit 0
