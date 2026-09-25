@@ -35,7 +35,7 @@ bash install.sh --global
 This sets `core.hooksPath` to `~/.config/git/hooks` (unless it is already set somewhere else) and installs the hook there. Nothing is overwritten:
 
 - the hook is copied to `<hooks dir>/strip-coauthor`;
-- `<hooks dir>/pre-push` becomes a small dispatcher that runs strip-coauthor first, then any `pre-push` hook that was already there (moved to `pre-push.chained`), then the repository's own `.git/hooks/pre-push` — which git would otherwise ignore once `core.hooksPath` is set;
+- `<hooks dir>/pre-push` becomes a small dispatcher that runs strip-coauthor first, then any `pre-push` hook that was already there (moved to `pre-push.chained`). If there was none, it runs the repository's own `.git/hooks/pre-push` instead, which git would otherwise ignore once `core.hooksPath` is set; if there was one, whether the repo's hook runs stays up to that hook, as before;
 - the first hook that fails stops the push. Re-running the installer only refreshes strip-coauthor and the dispatcher.
 
 ### Quick one-liner (global)

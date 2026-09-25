@@ -14,8 +14,10 @@
 #   1. strip-coauthor
 #   2. pre-push.chained    - whatever pre-push hook was there before installing
 #                            (moved aside, never deleted)
-#   3. the repo's own .git/hooks/pre-push, which git ignores once
-#      core.hooksPath is set (skipped when that is the dispatcher itself)
+#   3. otherwise, the repo's own .git/hooks/pre-push, which git ignores once
+#      core.hooksPath is set (skipped when that is the dispatcher itself).
+#      When there is a chained hook, running the repo's hook stays its job,
+#      exactly as before installing.
 # The first hook to fail stops the push.  Re-running the installer only
 # refreshes strip-coauthor and the dispatcher.
 
@@ -90,7 +92,13 @@ run() {
 }
 
 run "$HOOK_DIR/strip-coauthor" "$@"
-run "$HOOK_DIR/pre-push.chained" "$@"
+
+if [[ -e "$HOOK_DIR/pre-push.chained" ]]; then
+  # The hook that was here before owns whether the repo's own pre-push runs
+  # (many global hooks already chain it); running it here too would run it twice.
+  run "$HOOK_DIR/pre-push.chained" "$@"
+  exit 0
+fi
 
 REPO_HOOKS="$(git rev-parse --git-common-dir)/hooks"
 if [[ -d "$REPO_HOOKS" && "$(cd "$REPO_HOOKS" && pwd -P)" != "$HOOK_DIR" ]]; then
