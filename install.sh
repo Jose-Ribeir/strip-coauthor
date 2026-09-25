@@ -14,10 +14,11 @@
 #   1. strip-coauthor
 #   2. pre-push.chained    - whatever pre-push hook was there before installing
 #                            (moved aside, never deleted)
-#   3. otherwise, the repo's own .git/hooks/pre-push, which git ignores once
+#   3. the repo's own .git/hooks/pre-push, which git ignores once
 #      core.hooksPath is set (skipped when that is the dispatcher itself).
-#      When there is a chained hook, running the repo's hook stays its job,
-#      exactly as before installing.
+#      By default only when there is no runnable chained hook: that hook
+#      already decided whether the repo's hook runs before installing.
+#      Override with `git config strip-coauthor.runRepoHook true|false`.
 # The first hook to fail stops the push.  Re-running the installer only
 # refreshes strip-coauthor and the dispatcher.
 
@@ -85,23 +86,32 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 INPUT="$(cat)"
 [[ -n "$INPUT" ]] && INPUT+=$'\n'
 
+runnable() { [[ -f "$1" && -x "$1" ]]; }
+
 run() {
   local hook="$1"; shift
-  [[ -f "$hook" && -x "$hook" ]] || return 0
+  runnable "$hook" || return 0
   printf '%s' "$INPUT" | "$hook" "$@"
 }
 
 run "$HOOK_DIR/strip-coauthor" "$@"
+run "$HOOK_DIR/pre-push.chained" "$@"
 
-if [[ -e "$HOOK_DIR/pre-push.chained" ]]; then
-  # The hook that was here before owns whether the repo's own pre-push runs
-  # (many global hooks already chain it); running it here too would run it twice.
-  run "$HOOK_DIR/pre-push.chained" "$@"
-  exit 0
+# Whether to also run the repo's own .git/hooks/pre-push, which git itself
+# never runs once core.hooksPath points elsewhere.  Default: only when there
+# is no chained hook.  A chained hook was in charge of that before strip-
+# coauthor was installed (global hooks such as review-gate run it themselves),
+# so leaving it to that hook keeps the exact pre-install behaviour and avoids
+# running the repo hook twice.  Override per repo or globally with
+#   git config strip-coauthor.runRepoHook true|false
+RUN_REPO_HOOK="$(git config --type=bool strip-coauthor.runRepoHook || true)"
+if [[ -z "$RUN_REPO_HOOK" ]]; then
+  runnable "$HOOK_DIR/pre-push.chained" && RUN_REPO_HOOK=false || RUN_REPO_HOOK=true
 fi
 
 REPO_HOOKS="$(git rev-parse --git-common-dir)/hooks"
-if [[ -d "$REPO_HOOKS" && "$(cd "$REPO_HOOKS" && pwd -P)" != "$HOOK_DIR" ]]; then
+if [[ "$RUN_REPO_HOOK" == true && -d "$REPO_HOOKS" &&
+      "$(cd "$REPO_HOOKS" && pwd -P)" != "$HOOK_DIR" ]]; then
   run "$REPO_HOOKS/pre-push" "$@"
 fi
 SH
