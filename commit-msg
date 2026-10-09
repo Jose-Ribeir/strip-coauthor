@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# strip-coauthor: git commit-msg hook that removes Co-Authored-By trailers from
+# the message before the commit is created.
+#
+# Install:
+#   bash install.sh             # this repo
+#   bash install.sh --global    # every repo (via core.hooksPath)
+#
+# Git passes the path of the message file as $1 and creates the commit from
+# whatever the file holds once this hook exits.  Stripping here means the
+# commit is born clean, so the pre-push hook has nothing to rewrite and the
+# SHAs you push are the SHAs you committed.  The pre-push hook stays as a
+# fallback for commits that skipped this one (--no-verify, cherry-pick,
+# rebase, commits made before installing).
+#
+# Same rule as the pre-push hook: drop every line starting with
+# "Co-Authored-By:" (any case) and, if one was dropped, the trailing blank
+# lines left behind.  The file is only rewritten when something was dropped.
+
+set -euo pipefail
+
+MSG_FILE="${1:?usage: commit-msg <message-file>}"
+TMP="$MSG_FILE.strip-coauthor"
+trap 'rm -f "$TMP"' EXIT
+
+status=0
+awk '
+  tolower(substr($0, 1, 15)) == "co-authored-by:" { removed = 1; next }
+  { lines[++n] = $0 }
+  END {
+    if (!removed) exit 10
+    while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+    for (i = 1; i <= n; i++) print lines[i]
+  }
+' "$MSG_FILE" > "$TMP" || status=$?
+
+case "$status" in
+  0)  cat "$TMP" > "$MSG_FILE" ;;
+  10) ;;  # no trailer: leave the file exactly as it was
+  *)  echo "[strip-coauthor] Could not read $MSG_FILE; commit blocked." >&2
+      exit 1 ;;
+esac

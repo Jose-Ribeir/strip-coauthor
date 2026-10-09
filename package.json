@@ -1,11 +1,12 @@
 {
   "name": "strip-coauthor",
   "version": "1.0.0",
-  "description": "Git pre-push hook that silently removes Co-Authored-By trailers before pushing",
+  "description": "Git commit-msg and pre-push hooks that remove Co-Authored-By trailers without changing pushed SHAs",
   "keywords": [
     "git",
     "hook",
     "pre-push",
+    "commit-msg",
     "co-authored-by",
     "claude",
     "ai",
@@ -28,6 +29,7 @@
   "files": [
     "bin/",
     "pre-push",
+    "commit-msg",
     "install.sh"
   ],
   "engines": {
