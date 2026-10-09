@@ -27,7 +27,7 @@
 #      already decided whether the repo's hook runs before installing.
 #      Override with `git config strip-coauthor.runRepoHook true|false`.
 # The first hook to fail stops the commit or push.  Re-running the installer only
-# refreshes strip-coauthor and the dispatcher.
+# refreshes the strip-coauthor scripts and the dispatchers.
 
 set -euo pipefail
 
